@@ -6,11 +6,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use chrono::{DateTime, Utc};
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 use tokio::fs as afs;
 use tokio_util::io::ReaderStream;
@@ -85,9 +85,8 @@ pub async fn list_files(
         };
 
         let mod_time = metadata.modified().ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map(|t| DateTime::<Utc>::from(t).to_rfc3339())
+            .unwrap_or_default();
 
         let mut item = json!({
             "name": name,
