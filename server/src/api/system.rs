@@ -48,7 +48,7 @@ pub async fn get_system_info() -> Json<Value> {
     sys.refresh_all();
 
     // CPU
-    let cpu_usage = sys.global_cpu_usage() as f64;
+    let cpu_usage = sys.global_cpu_info().cpu_usage() as f64;
     let cpu_model = sys.cpus().first()
         .map(|c| c.brand().to_string())
         .unwrap_or_default();
