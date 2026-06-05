@@ -9,50 +9,59 @@ on:
         type: string
 
 jobs:
-  # ─── Build Go Server ────────────────────────────────────────────
+  # ─── Build Rust Server ──────────────────────────────────────────
   build-server:
-    name: Build Server (Go) (${{ matrix.suffix }})
+    name: Build Server (Rust) (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
+          - target: x86_64-unknown-linux-musl
             suffix: linux-amd64
-          - goos: linux
-            goarch: arm64
+          - target: aarch64-unknown-linux-musl
             suffix: linux-arm64
-          - goos: linux
-            goarch: arm
-            goarm: "7"
+          - target: armv7-unknown-linux-musleabihf
             suffix: linux-armv7
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: '1.21'
-          cache-dependency-path: server/go.sum
+          targets: ${{ matrix.target }}
 
-      - name: Download dependencies
-        working-directory: server
+      - name: Install cross-compilation tools
         run: |
-          rm -f go.sum
-          go mod tidy
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: rust-${{ matrix.target }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: rust-${{ matrix.target }}-
 
       - name: Build
         working-directory: server
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm || '' }}
-          CGO_ENABLED: 0
+          VM_VERSION: ${{ github.event.inputs.version }}
         run: |
+          cross build --release --target ${{ matrix.target }}
           mkdir -p ../dist
-          go build -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" -o ../dist/vm-server-${{ matrix.suffix }} .
+          cp target/${{ matrix.target }}/release/vm-server \
+             ../dist/vm-server-${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -85,9 +94,7 @@ jobs:
       - name: Set version
         working-directory: client
         run: |
-          # version name = input, versionCode = integer from input (e.g. 1.0.0 -> 100)
           VERSION="${{ github.event.inputs.version }}"
-          # Build versionCode: strip dots and left-pad to integer e.g. 1.2.3 -> 10203
           CODE=$(echo "$VERSION" | awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')
           sed -i "s/^version: .*/version: ${VERSION}+${CODE}/" pubspec.yaml
           echo "Set version: ${VERSION}+${CODE}"
@@ -123,7 +130,7 @@ jobs:
   # ─── Create Release ─────────────────────────────────────────────
   release:
     name: Create Release
-    needs: [ build-server, build-client ]
+    needs: [build-server, build-client]
     runs-on: ubuntu-latest
 
     steps:
@@ -142,7 +149,7 @@ jobs:
       - name: Prepare extras
         run: |
           cp server/config.yaml.example dist/config.yaml.example || true
-          cp server/vps-agent.service   dist/vm-server.service   || true
+          cp server/vm-server.service    dist/vm-server.service   || true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
