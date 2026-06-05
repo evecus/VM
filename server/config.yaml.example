@@ -1,0 +1,6 @@
+port: "8888"
+token: "change-this-to-a-strong-secret-token"
+tls:
+  enabled: false
+  cert: "/etc/letsencrypt/live/yourdomain.com/fullchain.pem"
+  key: "/etc/letsencrypt/live/yourdomain.com/privkey.pem"
