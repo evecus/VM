@@ -25,7 +25,7 @@ fn is_valid_service_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// 检测当前 init 系统：systemd / openrc / unknown
+/// 检测当前 init 系统：systemd / openrc / procd / unknown
 fn detect_init() -> &'static str {
     // systemd: /run/systemd/private 目录存在，或 systemctl 可用
     if std::path::Path::new("/run/systemd/private").exists() {
@@ -36,14 +36,20 @@ fn detect_init() -> &'static str {
     {
         return "systemd";
     }
-    // openrc: /sbin/openrc 或 /sbin/rc-status 存在
+    // procd (OpenWrt): 必须在 openrc 之前判断
+    // OpenWrt 也有 /etc/init.d/ 但脚本格式和命令完全不同
+    if std::path::Path::new("/sbin/procd").exists()
+        || std::path::Path::new("/etc/rc.common").exists()
+    {
+        return "procd";
+    }
+    // openrc (Alpine 等)
     if std::path::Path::new("/sbin/openrc").exists()
         || std::path::Path::new("/sbin/rc-status").exists()
         || std::path::Path::new("/usr/sbin/rc-status").exists()
     {
         return "openrc";
     }
-    // openrc fallback: rc-status 可调用
     if Command::new("rc-status").arg("--version").output()
         .map(|o| o.status.success()).unwrap_or(false)
     {
@@ -174,6 +180,119 @@ fn get_services_openrc() -> Vec<Value> {
     services
 }
 
+
+// ── procd (OpenWrt) ───────────────────────────────────────────────
+
+fn get_services_procd() -> Vec<Value> {
+    // 没有统一的列表命令，从 /etc/init.d/ 枚举
+    let mut services: Vec<Value> = Vec::new();
+
+    // 已启用的服务：/etc/rc.d/ 下有 S??name 软链
+    let enabled_set: std::collections::HashSet<String> = fs::read_dir("/etc/rc.d")
+        .map(|entries| {
+            entries.flatten()
+                .filter_map(|e| {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    // S 开头是启动链接，格式 S<priority><name>
+                    if fname.starts_with('S') && fname.len() > 3 {
+                        Some(fname[3..].to_string())  // 去掉 S 和两位数字
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let entries = match fs::read_dir("/etc/init.d") {
+        Ok(e) => e,
+        Err(_) => return services,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+
+        // 检查是否是 procd 或 rc.common 脚本（跳过非服务文件如 README）
+        let path = format!("/etc/init.d/{}", name);
+        let is_script = fs::read_to_string(&path)
+            .map(|c| c.contains("rc.common") || c.contains("USE_PROCD"))
+            .unwrap_or(false);
+        if !is_script { continue; }
+
+        // 查询运行状态：/etc/init.d/<name> running，exit 0 = running
+        let running = Command::new(&path)
+            .arg("running")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let (active_state, sub_state) = if running {
+            ("active", "running")
+        } else {
+            ("inactive", "dead")
+        };
+
+        services.push(json!({
+            "name": name,
+            "description": "",
+            "loadState": "loaded",
+            "activeState": active_state,
+            "subState": sub_state,
+            "enabled": enabled_set.contains(&name),
+            "runlevel": "",
+        }));
+    }
+
+    // 按名称排序
+    services.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+
+    services
+}
+
+fn build_procd_script(
+    name: &str, desc: Option<&str>, exec_start: &str,
+    working_dir: Option<&str>, user: Option<&str>, respawn: bool,
+) -> String {
+    let mut s = String::from("#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+STOP=01
+
+");
+    if let Some(d) = desc.filter(|d| !d.is_empty()) {
+        s.push_str(&format!("# {}
+
+", d));
+    }
+    s.push_str("start_service() {
+    procd_open_instance
+");
+    s.push_str(&format!("    procd_set_param command {}
+", exec_start));
+    if let Some(wd) = working_dir.filter(|w| !w.is_empty()) {
+        s.push_str(&format!("    procd_set_param env PWD={}
+", wd));
+    }
+    if let Some(u) = user.filter(|u| !u.is_empty()) {
+        s.push_str(&format!("    procd_set_param user {}
+", u));
+    }
+    if respawn {
+        s.push_str("    procd_set_param respawn
+");
+    }
+    s.push_str(&format!("    procd_set_param pidfile /var/run/{}.pid
+", name));
+    s.push_str("    procd_close_instance
+}
+");
+    s
+}
+
 // ── handlers ─────────────────────────────────────────────────────
 
 pub async fn get_services() -> Json<Value> {
@@ -181,6 +300,7 @@ pub async fn get_services() -> Json<Value> {
     let services = match init {
         "systemd" => get_services_systemd(),
         "openrc"  => get_services_openrc(),
+        "procd"   => get_services_procd(),
         _         => vec![],
     };
     Json(json!({ "initSystem": init, "services": services }))
@@ -225,6 +345,13 @@ pub async fn service_action(
                 _ => {}
             }
         }
+        "procd" => {
+            // procd: start/stop/restart/enable/disable 都直接调 /etc/init.d/<name> <action>
+            // reload 不支持，映射到 restart
+            let action = if req.action == "reload" { "restart" } else { &req.action };
+            run_cmd_stderr(&format!("/etc/init.d/{}", name), &[action])
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+        }
         _ => {
             return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported init system"}))));
         }
@@ -254,6 +381,14 @@ pub async fn get_service_unit(
             let path = format!("/etc/init.d/{}", name);
             match fs::read_to_string(&path) {
                 Ok(content) => Ok(Json(json!({"content": content, "path": path, "initSystem": "openrc"}))),
+                Err(_) => Err((StatusCode::NOT_FOUND, Json(json!({"error": "init script not found"})))),
+            }
+        }
+        "procd" => {
+            // procd 脚本也在 /etc/init.d/，但格式是 rc.common shell 脚本
+            let path = format!("/etc/init.d/{}", name);
+            match fs::read_to_string(&path) {
+                Ok(content) => Ok(Json(json!({"content": content, "path": path, "initSystem": "procd"}))),
                 Err(_) => Err((StatusCode::NOT_FOUND, Json(json!({"error": "init script not found"})))),
             }
         }
@@ -356,11 +491,22 @@ pub async fn create_service(
             );
             let path = format!("/etc/init.d/{}", req.name);
             fs::write(&path, &script).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
-            // chmod +x
             run_cmd("chmod", &["+x", &path]);
-            // 加入 runlevel
             let runlevel = req.runlevel.as_deref().filter(|s| !s.is_empty()).unwrap_or("default");
             run_cmd("rc-update", &["add", &req.name, runlevel]);
+            Ok(Json(json!({"success": true, "path": path})))
+        }
+        "procd" => {
+            let script = build_procd_script(
+                &req.name, req.description.as_deref(), &req.exec_start,
+                req.working_dir.as_deref(), req.user.as_deref(),
+                req.respawn.unwrap_or(true),
+            );
+            let path = format!("/etc/init.d/{}", req.name);
+            fs::write(&path, &script).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+            run_cmd("chmod", &["+x", &path]);
+            // procd 开机自启：/etc/init.d/<name> enable
+            run_cmd(&path, &["enable"]);
             Ok(Json(json!({"success": true, "path": path})))
         }
         _ => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported init system"})))),
@@ -411,6 +557,17 @@ pub async fn update_service(
             run_cmd("chmod", &["+x", &path]);
             Ok(Json(json!({"success": true})))
         }
+        "procd" => {
+            let script = build_procd_script(
+                &name, req.description.as_deref(), &req.exec_start,
+                req.working_dir.as_deref(), req.user.as_deref(),
+                req.respawn.unwrap_or(true),
+            );
+            let path = format!("/etc/init.d/{}", name);
+            fs::write(&path, &script).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+            run_cmd("chmod", &["+x", &path]);
+            Ok(Json(json!({"success": true})))
+        }
         _ => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported init system"})))),
     }
 }
@@ -434,6 +591,13 @@ pub async fn delete_service(
             run_cmd("rc-service", &[&name, "stop"]);
             run_cmd("rc-update", &["del", &name]);
             let path = format!("/etc/init.d/{}", name);
+            fs::remove_file(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        }
+        "procd" => {
+            let path = format!("/etc/init.d/{}", name);
+            // 先 disable（删除 /etc/rc.d/ 软链），再 stop，再删脚本
+            run_cmd(&path, &["disable"]);
+            run_cmd(&path, &["stop"]);
             fs::remove_file(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
         }
         _ => {

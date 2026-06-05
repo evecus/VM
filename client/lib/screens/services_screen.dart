@@ -524,7 +524,7 @@ class _ServiceCardState extends State<_ServiceCard> {
                           _actionBtn('重启', Icons.refresh,
                               AppTheme.warning, () => widget.onAction('restart')),
                         // reload 仅 systemd 显示
-                        if (svc.isRunning && widget.initSystem == 'systemd')
+                        if (svc.isRunning && widget.initSystem == 'systemd')  // procd/openrc 无 reload
                           _actionBtn('重载', Icons.sync,
                               AppTheme.info, () => widget.onAction('reload')),
                         if (svc.enabled)
@@ -632,6 +632,9 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
   bool _saving  = false;
 
   bool get _isOpenRC => widget.initSystem == 'openrc';
+  bool get _isProcd  => widget.initSystem == 'procd';
+  // procd 和 openrc 都没有 reload，表单字段也相似
+  bool get _isSystemd => widget.initSystem == 'systemd';
 
   @override
   void initState() {
@@ -648,6 +651,8 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
       _rawCtrl.text = widget.initialUnit!;
       if (_isOpenRC) {
         _parseOpenRCScript(widget.initialUnit!);
+      } else if (_isProcd) {
+        _parseProcdScript(widget.initialUnit!);
       } else {
         _parseSystemdUnit(widget.initialUnit!);
       }
@@ -668,6 +673,23 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
         case 'Restart':          _restart  = val; break;
         case 'WantedBy':         _wantedBy = val; break;
       }
+    }
+  }
+
+  void _parseProcdScript(String content) {
+    // 从 procd 脚本里提取 procd_set_param command ... 行
+    for (final line in content.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.startsWith('procd_set_param command ')) {
+        _execCtrl.text = trimmed.replaceFirst('procd_set_param command ', '').trim();
+      } else if (trimmed.startsWith('procd_set_param user ')) {
+        _userCtrl.text = trimmed.replaceFirst('procd_set_param user ', '').trim();
+      } else if (trimmed.startsWith('procd_set_param env PWD=')) {
+        _wdCtrl.text = trimmed.replaceFirst('procd_set_param env PWD=', '').trim();
+      } else if (trimmed.startsWith('# ') && _descCtrl.text.isEmpty) {
+        _descCtrl.text = trimmed.replaceFirst('# ', '').trim();
+      }
+      if (trimmed == 'procd_set_param respawn') _respawn = true;
     }
   }
 
@@ -722,7 +744,7 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
           'workingDir':  _wdCtrl.text.trim(),
           'user':        _userCtrl.text.trim(),
         };
-        if (_isOpenRC) {
+        if (_isOpenRC || _isProcd) {
           data['runlevel'] = _runlevel;
           data['respawn']  = _respawn;
         } else {
@@ -817,7 +839,7 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
               indicatorColor: AppTheme.primary,
               tabs: [
                 const Tab(text: '表单'),
-                Tab(text: _isOpenRC ? '原始脚本' : '原始 Unit'),
+                Tab(text: (_isOpenRC || _isProcd) ? '原始脚本' : '原始 Unit'),
               ],
             ),
             Flexible(
@@ -844,36 +866,7 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
         _field('工作目录', _wdCtrl, '如: /opt/myapp（可选）'),
         _field('运行用户', _userCtrl, '如: www-data（留空则 root）'),
         const SizedBox(height: 8),
-        if (_isOpenRC) ...[
-          // OpenRC: runlevel + respawn
-          _dropRow('Runlevel', _runlevel,
-              ['default', 'boot', 'sysinit', 'nonetwork'],
-              (v) => setState(() => _runlevel = v!)),
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Row(
-              children: [
-                const SizedBox(
-                  width: 80,
-                  child: Text('自动重启',
-                      style: TextStyle(
-                          color: AppTheme.textSecondary, fontSize: 12)),
-                ),
-                Switch(
-                  value: _respawn,
-                  onChanged: (v) => setState(() => _respawn = v),
-                  activeColor: AppTheme.primary,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  _respawn ? '崩溃后自动重启 (respawn)' : '不自动重启',
-                  style: const TextStyle(
-                      color: AppTheme.textSecondary, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-        ] else ...[
+        if (_isSystemd) ...[
           // systemd: restart policy + WantedBy
           _dropRow('重启策略', _restart, [
             'no', 'on-success', 'on-failure', 'on-abnormal',
@@ -882,6 +875,15 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
           _dropRow('WantedBy', _wantedBy, [
             'multi-user.target', 'graphical.target', 'network.target'
           ], (v) => setState(() => _wantedBy = v!)),
+        ] else if (_isOpenRC) ...[
+          // OpenRC: runlevel + respawn
+          _dropRow('Runlevel', _runlevel,
+              ['default', 'boot', 'sysinit', 'nonetwork'],
+              (v) => setState(() => _runlevel = v!)),
+          _respawnRow(),
+        ] else if (_isProcd) ...[
+          // procd (OpenWrt): 无 runlevel 概念（由脚本内 START= 控制），只有 respawn
+          _respawnRow(),
         ],
         const SizedBox(height: 16),
       ],
@@ -896,7 +898,7 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
           Row(
             children: [
               Text(
-                _isOpenRC ? '直接编辑 init 脚本' : '直接编辑 unit 文件',
+                (_isOpenRC || _isProcd) ? '直接编辑 init 脚本' : '直接编辑 unit 文件',
                 style: const TextStyle(
                     color: AppTheme.textSecondary, fontSize: 12),
               ),
@@ -999,6 +1001,31 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
                   .toList(),
               onChanged: onChange,
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _respawnRow() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 80,
+            child: Text('自动重启',
+                style: TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
+          ),
+          Switch(
+            value: _respawn,
+            onChanged: (v) => setState(() => _respawn = v),
+            activeColor: AppTheme.primary,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _respawn ? '崩溃后自动重启 (respawn)' : '不自动重启',
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
           ),
         ],
       ),
