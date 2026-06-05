@@ -1,7 +1,7 @@
 use axum::{extract::Path, http::StatusCode, response::Json};
 use serde_json::{json, Value};
 use std::process::Command;
-use sysinfo::{CpuExt, DiskExt, NetworkExt, ProcessExt, System, SystemExt};
+use sysinfo::{Disks, Networks, System};
 
 fn run_cmd(prog: &str, args: &[&str]) -> String {
     Command::new(prog)
@@ -48,7 +48,7 @@ pub async fn get_system_info() -> Json<Value> {
     sys.refresh_all();
 
     // CPU
-    let cpu_usage = sys.global_cpu_info().cpu_usage() as f64;
+    let cpu_usage = sys.global_cpu_usage() as f64;
     let cpu_model = sys.cpus().first()
         .map(|c| c.brand().to_string())
         .unwrap_or_default();
@@ -65,8 +65,8 @@ pub async fn get_system_info() -> Json<Value> {
     };
 
     // Disk (root)
-    let (disk_total, disk_used, disk_free, disk_percent) = sys
-        .disks()
+    let disks = Disks::new_with_refreshed_list();
+    let (disk_total, disk_used, disk_free, disk_percent) = disks
         .iter()
         .find(|d| d.mount_point().to_str() == Some("/"))
         .map(|d| {
@@ -78,18 +78,19 @@ pub async fn get_system_info() -> Json<Value> {
         })
         .unwrap_or((0, 0, 0, 0.0));
 
-    // Host info
-    let hostname = sys.host_name().unwrap_or_default();
-    let os_name = sys.name().unwrap_or_default();
-    let os_version = sys.os_version().unwrap_or_default();
-    let kernel = sys.kernel_version().unwrap_or_default();
-    let uptime = sys.uptime();
+    // Host info (now associated functions in sysinfo 0.30+)
+    let hostname = System::host_name().unwrap_or_default();
+    let os_name = System::name().unwrap_or_default();
+    let os_version = System::os_version().unwrap_or_default();
+    let kernel = System::kernel_version().unwrap_or_default();
+    let uptime = System::uptime();
 
     // Load average
-    let load = sys.load_average();
+    let load = System::load_average();
 
     // Network I/O (sum all interfaces)
-    let (net_sent, net_recv): (u64, u64) = sys.networks().iter().fold((0, 0), |acc, (_, n)| {
+    let networks = Networks::new_with_refreshed_list();
+    let (net_sent, net_recv): (u64, u64) = networks.iter().fold((0, 0), |acc, (_, n)| {
         (acc.0 + n.total_transmitted(), acc.1 + n.total_received())
     });
 
@@ -160,7 +161,6 @@ pub async fn kill_process(
     match result {
         Ok(s) if s.success() => Ok(Json(json!({"success": true}))),
         Ok(_) => {
-            // Try SIGKILL
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             Ok(Json(json!({"success": true})))
         }

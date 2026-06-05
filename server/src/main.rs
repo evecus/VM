@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 /// VM Server version injected at build time
