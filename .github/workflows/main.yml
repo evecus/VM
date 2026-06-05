@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (如 1.0.0)'
+        description: '版本号 (如 v1.0.0)'
         required: true
         type: string
 
@@ -160,8 +160,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.version }}
-          name: VM v${{ github.event.inputs.version }}
+          tag_name: ${{ github.event.inputs.version }}
+          name: VM ${{ github.event.inputs.version }}
           draft: false
           prerelease: false
           generate_release_notes: true
