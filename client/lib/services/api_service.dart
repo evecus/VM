@@ -115,19 +115,25 @@ class ApiService {
   }
 
   // ── Services ──────────────────────────────────────────
-  Future<List<ServiceInfo>> getServices() async {
+  Future<Map<String, dynamic>> getServices() async {
     final res = await _dio.get('/api/services');
     final list = res.data['services'] as List;
-    return list.map((e) => ServiceInfo.fromJson(e as Map<String, dynamic>)).toList();
+    return {
+      'initSystem': res.data['initSystem'] as String? ?? 'unknown',
+      'services': list.map((e) => ServiceInfo.fromJson(e as Map<String, dynamic>)).toList(),
+    };
   }
 
   Future<void> serviceAction(String name, String action) async {
     await _dio.post('/api/services/$name/action', data: {'action': action});
   }
 
-  Future<String> getServiceUnit(String name) async {
+  Future<Map<String, String>> getServiceUnit(String name) async {
     final res = await _dio.get('/api/services/$name/unit');
-    return res.data['content'] as String;
+    return {
+      'content': res.data['content'] as String? ?? '',
+      'initSystem': res.data['initSystem'] as String? ?? 'unknown',
+    };
   }
 
   Future<void> createService(Map<String, dynamic> data) async {

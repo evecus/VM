@@ -324,6 +324,7 @@ class ServiceInfo {
   final String activeState; // active / inactive / failed / activating
   final String subState;    // running / dead / exited / …
   final bool enabled;       // enabled / disabled
+  final String runlevel;    // openrc: default / boot / sysinit; systemd: ''
 
   ServiceInfo({
     required this.name,
@@ -332,6 +333,7 @@ class ServiceInfo {
     required this.activeState,
     required this.subState,
     required this.enabled,
+    this.runlevel = '',
   });
 
   bool get isRunning => activeState == 'active' && subState == 'running';
@@ -344,6 +346,7 @@ class ServiceInfo {
         activeState: json['activeState'] ?? '',
         subState:    json['subState']    ?? '',
         enabled:     json['enabled']     ?? false,
+        runlevel:    json['runlevel']     ?? '',
       );
 
   Map<String, dynamic> toJson() => {
@@ -353,5 +356,6 @@ class ServiceInfo {
         'activeState': activeState,
         'subState':    subState,
         'enabled':     enabled,
+        'runlevel':    runlevel,
       };
 }

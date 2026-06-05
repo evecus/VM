@@ -18,8 +18,8 @@ class _ServicesScreenState extends State<ServicesScreen> {
   bool _loading = true;
   String? _error;
   String _search = '';
-  // filter: all / active / inactive / failed
   String _filter = 'all';
+  String _initSystem = 'unknown'; // systemd / openrc / unknown
 
   @override
   void initState() {
@@ -31,10 +31,11 @@ class _ServicesScreenState extends State<ServicesScreen> {
   Future<void> _load() async {
     setState(() { _loading = true; _error = null; });
     try {
-      final list = await _api.getServices();
+      final result = await _api.getServices();
       if (mounted) {
         setState(() {
-          _all = list;
+          _initSystem = result['initSystem'] as String;
+          _all = result['services'] as List<ServiceInfo>;
           _loading = false;
           _applyFilter();
         });
@@ -60,13 +61,15 @@ class _ServicesScreenState extends State<ServicesScreen> {
     _filtered = result;
   }
 
-  // ── Action with confirm dialog ───────────────────────────────
   Future<void> _doAction(ServiceInfo svc, String action) async {
     final labels = {
       'start': '启动', 'stop': '停止', 'restart': '重启',
       'reload': '重载', 'enable': '设为开机启动', 'disable': '取消开机启动',
     };
     final danger = {'stop', 'disable'};
+    // openrc 不支持 reload，屏蔽掉
+    if (_initSystem == 'openrc' && action == 'reload') return;
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -117,12 +120,14 @@ class _ServicesScreenState extends State<ServicesScreen> {
     }
   }
 
-  // ── Create / Edit dialog ─────────────────────────────────────
   Future<void> _showEditDialog({ServiceInfo? existing}) async {
     String? unitContent;
+    String unitInitSystem = _initSystem;
     if (existing != null) {
       try {
-        unitContent = await _api.getServiceUnit(existing.name);
+        final result = await _api.getServiceUnit(existing.name);
+        unitContent = result['content'];
+        unitInitSystem = result['initSystem'] ?? _initSystem;
       } catch (_) {}
     }
     if (!mounted) return;
@@ -136,6 +141,7 @@ class _ServicesScreenState extends State<ServicesScreen> {
         api: _api,
         existing: existing,
         initialUnit: unitContent,
+        initSystem: unitInitSystem,
         onSaved: () {
           Navigator.pop(ctx);
           _load();
@@ -144,7 +150,6 @@ class _ServicesScreenState extends State<ServicesScreen> {
     );
   }
 
-  // ── Delete confirm ───────────────────────────────────────────
   Future<void> _deleteService(ServiceInfo svc) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -154,7 +159,8 @@ class _ServicesScreenState extends State<ServicesScreen> {
         title: const Text('删除服务',
             style: TextStyle(color: AppTheme.textPrimary, fontSize: 16)),
         content: Text(
-          '确定要删除 ${svc.name} 吗？\n此操作将停止服务并删除 unit 文件，不可恢复。',
+          '确定要删除 ${svc.name} 吗？\n此操作将停止服务并删除'
+          '${_initSystem == "openrc" ? " init 脚本" : " unit 文件"}，不可恢复。',
           style: const TextStyle(color: AppTheme.textSecondary, fontSize: 14),
         ),
         actions: [
@@ -188,13 +194,11 @@ class _ServicesScreenState extends State<ServicesScreen> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // ── Top bar ──────────────────────────────────────────
         Container(
           color: AppTheme.surface,
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
           child: Column(
             children: [
-              // Search + add
               Row(
                 children: [
                   Expanded(
@@ -225,6 +229,23 @@ class _ServicesScreenState extends State<ServicesScreen> {
                       ),
                     ),
                   ),
+                  const SizedBox(width: 8),
+                  // init system badge
+                  if (_initSystem != 'unknown')
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: AppTheme.surfaceVariant,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: AppTheme.border),
+                      ),
+                      child: Text(
+                        _initSystem,
+                        style: const TextStyle(
+                            color: AppTheme.textSecondary, fontSize: 11),
+                      ),
+                    ),
                   const SizedBox(width: 8),
                   GestureDetector(
                     onTap: _load,
@@ -257,7 +278,6 @@ class _ServicesScreenState extends State<ServicesScreen> {
                 ],
               ),
               const SizedBox(height: 8),
-              // Filter chips
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
@@ -273,8 +293,6 @@ class _ServicesScreenState extends State<ServicesScreen> {
             ],
           ),
         ),
-
-        // ── List ─────────────────────────────────────────────
         Expanded(
           child: _loading
               ? const Center(
@@ -305,16 +323,15 @@ class _ServicesScreenState extends State<ServicesScreen> {
                       : ListView.builder(
                           padding: const EdgeInsets.all(12),
                           itemCount: _filtered.length,
-                          itemBuilder: (ctx, i) =>
-                              _ServiceCard(
-                                service: _filtered[i],
-                                onAction: (action) =>
-                                    _doAction(_filtered[i], action),
-                                onEdit: () =>
-                                    _showEditDialog(existing: _filtered[i]),
-                                onDelete: () =>
-                                    _deleteService(_filtered[i]),
-                              ),
+                          itemBuilder: (ctx, i) => _ServiceCard(
+                            service: _filtered[i],
+                            initSystem: _initSystem,
+                            onAction: (action) =>
+                                _doAction(_filtered[i], action),
+                            onEdit: () =>
+                                _showEditDialog(existing: _filtered[i]),
+                            onDelete: () => _deleteService(_filtered[i]),
+                          ),
                         ),
         ),
       ],
@@ -350,15 +367,17 @@ class _ServicesScreenState extends State<ServicesScreen> {
   }
 }
 
-// ── Service card ─────────────────────────────────────────────────
+// ── Service card ──────────────────────────────────────────────────
 class _ServiceCard extends StatefulWidget {
   final ServiceInfo service;
+  final String initSystem;
   final void Function(String action) onAction;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
 
   const _ServiceCard({
     required this.service,
+    required this.initSystem,
     required this.onAction,
     required this.onEdit,
     required this.onDelete,
@@ -399,7 +418,6 @@ class _ServiceCardState extends State<_ServiceCard> {
       ),
       child: Column(
         children: [
-          // ── Header row ──
           InkWell(
             onTap: () => setState(() => _expanded = !_expanded),
             borderRadius: BorderRadius.circular(10),
@@ -429,11 +447,19 @@ class _ServiceCardState extends State<_ServiceCard> {
                                 fontSize: 11),
                             overflow: TextOverflow.ellipsis,
                           ),
+                        // openrc: 显示 runlevel
+                        if (widget.initSystem == 'openrc' &&
+                            svc.runlevel.isNotEmpty)
+                          Text(
+                            'runlevel: ${svc.runlevel}',
+                            style: const TextStyle(
+                                color: AppTheme.textSecondary,
+                                fontSize: 10),
+                          ),
                       ],
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // enabled badge
                   Container(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 6, vertical: 2),
@@ -464,8 +490,6 @@ class _ServiceCardState extends State<_ServiceCard> {
               ),
             ),
           ),
-
-          // ── Expanded actions ──
           if (_expanded)
             Container(
               decoration: const BoxDecoration(
@@ -476,7 +500,6 @@ class _ServiceCardState extends State<_ServiceCard> {
                   const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               child: Column(
                 children: [
-                  // state info row
                   Row(
                     children: [
                       _badge(svc.activeState, stateColor),
@@ -487,7 +510,6 @@ class _ServiceCardState extends State<_ServiceCard> {
                     ],
                   ),
                   const SizedBox(height: 10),
-                  // action buttons
                   SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: Row(
@@ -501,6 +523,10 @@ class _ServiceCardState extends State<_ServiceCard> {
                         if (svc.isRunning)
                           _actionBtn('重启', Icons.refresh,
                               AppTheme.warning, () => widget.onAction('restart')),
+                        // reload 仅 systemd 显示
+                        if (svc.isRunning && widget.initSystem == 'systemd')
+                          _actionBtn('重载', Icons.sync,
+                              AppTheme.info, () => widget.onAction('reload')),
                         if (svc.enabled)
                           _actionBtn('禁用自启', Icons.toggle_off,
                               AppTheme.textSecondary, () => widget.onAction('disable'))
@@ -523,14 +549,14 @@ class _ServiceCardState extends State<_ServiceCard> {
   }
 
   Widget _badge(String text, Color color) {
+    if (text.isEmpty) return const SizedBox.shrink();
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
         color: color.withOpacity(0.12),
         borderRadius: BorderRadius.circular(4),
       ),
-      child: Text(text,
-          style: TextStyle(color: color, fontSize: 10)),
+      child: Text(text, style: TextStyle(color: color, fontSize: 10)),
     );
   }
 
@@ -568,12 +594,14 @@ class _ServiceEditSheet extends StatefulWidget {
   final ApiService api;
   final ServiceInfo? existing;
   final String? initialUnit;
+  final String initSystem;
   final VoidCallback onSaved;
 
   const _ServiceEditSheet({
     required this.api,
     required this.existing,
     required this.initialUnit,
+    required this.initSystem,
     required this.onSaved,
   });
 
@@ -587,44 +615,75 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
   final _nameCtrl = TextEditingController();
   final _descCtrl = TextEditingController();
   final _execCtrl = TextEditingController();
-  final _wdCtrl = TextEditingController();
+  final _wdCtrl   = TextEditingController();
   final _userCtrl = TextEditingController();
-  String _restart = 'on-failure';
+
+  // systemd
+  String _restart  = 'on-failure';
   String _wantedBy = 'multi-user.target';
 
-  // Raw unit editor
+  // openrc
+  String _runlevel = 'default';
+  bool   _respawn  = true;
+
+  // raw editor
   final _rawCtrl = TextEditingController();
-  bool _useRaw = false;
-  bool _saving = false;
+  bool _useRaw  = false;
+  bool _saving  = false;
+
+  bool get _isOpenRC => widget.initSystem == 'openrc';
 
   @override
   void initState() {
     super.initState();
     _tabs = TabController(length: 2, vsync: this);
     if (widget.existing != null) {
-      _nameCtrl.text = widget.existing!.name.replaceAll('.service', '');
+      _nameCtrl.text = widget.existing!.name;
       _descCtrl.text = widget.existing!.description;
+      if (widget.existing!.runlevel.isNotEmpty) {
+        _runlevel = widget.existing!.runlevel;
+      }
     }
     if (widget.initialUnit != null) {
       _rawCtrl.text = widget.initialUnit!;
-      _parseUnit(widget.initialUnit!);
+      if (_isOpenRC) {
+        _parseOpenRCScript(widget.initialUnit!);
+      } else {
+        _parseSystemdUnit(widget.initialUnit!);
+      }
     }
   }
 
-  void _parseUnit(String content) {
+  void _parseSystemdUnit(String content) {
     for (final line in content.split('\n')) {
       final kv = line.split('=');
       if (kv.length < 2) continue;
       final key = kv[0].trim();
       final val = kv.sublist(1).join('=').trim();
       switch (key) {
-        case 'Description': _descCtrl.text = val; break;
-        case 'ExecStart':   _execCtrl.text = val; break;
-        case 'WorkingDirectory': _wdCtrl.text = val; break;
-        case 'User':        _userCtrl.text = val; break;
-        case 'Restart':     _restart = val; break;
-        case 'WantedBy':    _wantedBy = val; break;
+        case 'Description':      _descCtrl.text = val; break;
+        case 'ExecStart':        _execCtrl.text = val; break;
+        case 'WorkingDirectory': _wdCtrl.text   = val; break;
+        case 'User':             _userCtrl.text = val; break;
+        case 'Restart':          _restart  = val; break;
+        case 'WantedBy':         _wantedBy = val; break;
       }
+    }
+  }
+
+  void _parseOpenRCScript(String content) {
+    for (final line in content.split('\n')) {
+      final kv = line.split('=');
+      if (kv.length < 2) continue;
+      final key = kv[0].trim();
+      final val = kv.sublist(1).join('=').trim().replaceAll('"', '');
+      switch (key) {
+        case 'description': _descCtrl.text = val; break;
+        case 'command':     _execCtrl.text = val; break;
+        case 'directory':   _wdCtrl.text   = val; break;
+        case 'command_user':_userCtrl.text = val; break;
+      }
+      if (line.trim() == 'respawn') _respawn = true;
     }
   }
 
@@ -633,28 +692,43 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
     try {
       final isEdit = widget.existing != null;
       if (_useRaw) {
-        // Save raw unit directly via write file API
-        final name = _nameCtrl.text.trim().replaceAll('.service', '');
-        final path = '/etc/systemd/system/$name.service';
+        // raw 模式：直接写文件
+        final name = _nameCtrl.text.trim();
+        final path = _isOpenRC
+            ? '/etc/init.d/$name'
+            : '/etc/systemd/system/$name.service';
         await widget.api.writeFile(path, _rawCtrl.text);
-        // daemon-reload via action trick: create a dummy then delete — instead
-        // just call update endpoint with raw flag if we add that later.
-        // For now the writeFile + daemon-reload on server side isn't automatic
-        // so we use the structured endpoint anyway and note this limitation.
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('已保存，请手动运行 systemctl daemon-reload'),
-              duration: Duration(seconds: 3)));
+        if (_isOpenRC) {
+          // chmod +x 需要服务端支持，暂时提示
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                  content: Text('已保存，请确保脚本有执行权限 (chmod +x)'),
+                  duration: Duration(seconds: 3)));
+          }
+        } else {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                  content: Text('已保存，请手动运行 systemctl daemon-reload'),
+                  duration: Duration(seconds: 3)));
+          }
+        }
       } else {
-        final data = {
-          'name': _nameCtrl.text.trim(),
+        final data = <String, dynamic>{
+          'name':        _nameCtrl.text.trim(),
           'description': _descCtrl.text.trim(),
-          'execStart': _execCtrl.text.trim(),
-          'workingDir': _wdCtrl.text.trim(),
-          'user': _userCtrl.text.trim(),
-          'restart': _restart,
-          'wantedBy': _wantedBy,
+          'execStart':   _execCtrl.text.trim(),
+          'workingDir':  _wdCtrl.text.trim(),
+          'user':        _userCtrl.text.trim(),
         };
+        if (_isOpenRC) {
+          data['runlevel'] = _runlevel;
+          data['respawn']  = _respawn;
+        } else {
+          data['restart']  = _restart;
+          data['wantedBy'] = _wantedBy;
+        }
         if (isEdit) {
           await widget.api.updateService(_nameCtrl.text.trim(), data);
         } else {
@@ -687,17 +761,14 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // handle
             Container(
               margin: const EdgeInsets.only(top: 10),
-              width: 36,
-              height: 4,
+              width: 36, height: 4,
               decoration: BoxDecoration(
                 color: AppTheme.border,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
-            // title
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
               child: Row(
@@ -709,13 +780,28 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
                         fontSize: 16,
                         fontWeight: FontWeight.w600),
                   ),
+                  const SizedBox(width: 8),
+                  // init system tag
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: AppTheme.surfaceVariant,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: AppTheme.border),
+                    ),
+                    child: Text(
+                      widget.initSystem,
+                      style: const TextStyle(
+                          color: AppTheme.textSecondary, fontSize: 10),
+                    ),
+                  ),
                   const Spacer(),
                   TextButton(
                     onPressed: _saving ? null : _save,
                     child: _saving
                         ? const SizedBox(
-                            width: 16,
-                            height: 16,
+                            width: 16, height: 16,
                             child: CircularProgressIndicator(
                                 strokeWidth: 2, color: AppTheme.primary))
                         : const Text('保存',
@@ -729,15 +815,15 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
               labelColor: AppTheme.primary,
               unselectedLabelColor: AppTheme.textSecondary,
               indicatorColor: AppTheme.primary,
-              tabs: const [Tab(text: '表单'), Tab(text: '原始 Unit')],
+              tabs: [
+                const Tab(text: '表单'),
+                Tab(text: _isOpenRC ? '原始脚本' : '原始 Unit'),
+              ],
             ),
             Flexible(
               child: TabBarView(
                 controller: _tabs,
-                children: [
-                  _formTab(),
-                  _rawTab(),
-                ],
+                children: [_formTab(), _rawTab()],
               ),
             ),
           ],
@@ -753,17 +839,50 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
         _field('服务名称', _nameCtrl, '如: myapp',
             enabled: widget.existing == null),
         _field('描述', _descCtrl, '简短描述（可选）'),
-        _field('启动命令', _execCtrl, '如: /usr/bin/node /app/index.js'),
+        _field('启动命令', _execCtrl,
+            _isOpenRC ? '如: /usr/sbin/nginx' : '如: /usr/bin/node /app/index.js'),
         _field('工作目录', _wdCtrl, '如: /opt/myapp（可选）'),
         _field('运行用户', _userCtrl, '如: www-data（留空则 root）'),
         const SizedBox(height: 8),
-        _dropRow('重启策略', _restart, [
-          'no', 'on-success', 'on-failure', 'on-abnormal',
-          'on-abort', 'always'
-        ], (v) => setState(() => _restart = v!)),
-        _dropRow('WantedBy', _wantedBy, [
-          'multi-user.target', 'graphical.target', 'network.target'
-        ], (v) => setState(() => _wantedBy = v!)),
+        if (_isOpenRC) ...[
+          // OpenRC: runlevel + respawn
+          _dropRow('Runlevel', _runlevel,
+              ['default', 'boot', 'sysinit', 'nonetwork'],
+              (v) => setState(() => _runlevel = v!)),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                const SizedBox(
+                  width: 80,
+                  child: Text('自动重启',
+                      style: TextStyle(
+                          color: AppTheme.textSecondary, fontSize: 12)),
+                ),
+                Switch(
+                  value: _respawn,
+                  onChanged: (v) => setState(() => _respawn = v),
+                  activeColor: AppTheme.primary,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  _respawn ? '崩溃后自动重启 (respawn)' : '不自动重启',
+                  style: const TextStyle(
+                      color: AppTheme.textSecondary, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ] else ...[
+          // systemd: restart policy + WantedBy
+          _dropRow('重启策略', _restart, [
+            'no', 'on-success', 'on-failure', 'on-abnormal',
+            'on-abort', 'always'
+          ], (v) => setState(() => _restart = v!)),
+          _dropRow('WantedBy', _wantedBy, [
+            'multi-user.target', 'graphical.target', 'network.target'
+          ], (v) => setState(() => _wantedBy = v!)),
+        ],
         const SizedBox(height: 16),
       ],
     );
@@ -776,9 +895,11 @@ class _ServiceEditSheetState extends State<_ServiceEditSheet>
         children: [
           Row(
             children: [
-              const Text('直接编辑 unit 文件',
-                  style: TextStyle(
-                      color: AppTheme.textSecondary, fontSize: 12)),
+              Text(
+                _isOpenRC ? '直接编辑 init 脚本' : '直接编辑 unit 文件',
+                style: const TextStyle(
+                    color: AppTheme.textSecondary, fontSize: 12),
+              ),
               const Spacer(),
               Switch(
                 value: _useRaw,
